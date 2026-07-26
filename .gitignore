@@ -1,0 +1,39 @@
+# datos crudos (2+ GB, se distribuyen por Drive, nunca a git/github)
+*.csv
+!requirements.txt
+dataset_gee_centroamerica_completo.csv
+dataset_modelo_worldcover.csv
+
+# muestras y artefactos intermedios
+*.parquet
+*.npy
+
+# modelos entrenados (pesados, se regeneran corriendo los scripts)
+modelos/
+modelos_ensemble/
+*.joblib
+
+# salidas generadas (se regeneran corriendo los scripts; si se quiere mostrar
+# evidencia en el repo, mover a mano solo las figuras finales a docs/figuras)
+eda_salidas/
+resultados_modelo/
+resultados_ensemble/
+figuras/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# latex
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# sistema
+.DS_Store
+Thumbs.db
