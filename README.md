@@ -90,3 +90,48 @@ Ensemble por bootstrapping, 5 samples, sin reemplazo, split temporal
 | **XGBoost** | **0.1274** | **0.9326** |
 
 Tasa base de incendio en el conjunto de prueba: 0.0090 (XGBoost ≈ 14× el azar).
+## Mapa de calor de riesgo (completado)
+
+Pipeline para generar el mapa de riesgo de incendio sobre toda Centroamérica
+(no solo puntos del dataset), corrido en Kabré.
+
+**Scripts** (en `src/`):
+- `entrenar_ensemble_paralelo.py` — versión de `modelo_tes.py` que reparte
+  los samples del ensemble entre núcleos con `joblib.Parallel`, en vez de
+  entrenarlos secuencialmente. Uso:
+Guarda log de tiempos en `benchmark_entrenamiento.csv` (columnas:
+  n_jobs, n_samples, tiempo_segundos) — insumo directo para la tabla de
+  speedup/eficiencia CPU.
+- `generar_grid_marzo.js` — script de Google Earth Engine (se corre en
+  code.earthengine.google.com, no en Kabré) que genera una cuadrícula de
+  Centroamérica a 5 km con las condiciones típicas de marzo (época seca) de
+  las mismas 5 fuentes del dataset original. Exporta CSV a Google Drive.
+- `predict_heatmap.py` — carga el ensemble de XGBoost ya entrenado
+  (`modelos_ensemble/xgboost_sample*.joblib`) y predice la probabilidad de
+  incendio sobre cada celda de la cuadrícula, en paralelo. Uso:
+- `generar_mapa.py` — pinta el CSV de probabilidades como mapa de calor
+  interactivo (Folium), corre en cualquier compu (no necesita Kabré).
+
+**Resultados** (en `resultados_mapa_calor/`):
+- `grid_marzo_centroamerica.csv` — cuadrícula de 24,095 celdas con features
+- `predicciones_marzo.csv` — probabilidad de incendio por celda (lat, lon, probabilidad)
+- `mapa_riesgo_marzo.html` — mapa interactivo, listo para el dashboard
+
+**Modelos entrenados**: `modelos_ensemble.tar.gz` (132MB, no está en git por
+tamaño) está en la carpeta de Drive del proyecto, junto al dataset. Contiene
+5 samples × 3 modelos (logística, random forest, xgboost) entrenados en
+Kabré (partición `kura`, 4 núcleos).
+
+## Pendiente: benchmark de rendimiento en Kabré
+
+Falta la comparación CPU vs GPU que menciona el informe (Sección VI.D,
+cuML de RAPIDS). Plan:
+
+1. **Benchmark CPU**: correr `entrenar_ensemble_paralelo.py` en la
+   partición `kura` con distintos `--n-jobs` (1, 2, 4, 8, 16...) y armar
+   la tabla de speedup/eficiencia con `benchmark_entrenamiento.csv`.
+2. **Benchmark GPU (falta escribir el script)**: misma lógica pero
+   reemplazando `RandomForestClassifier`/`XGBClassifier` de sklearn por sus
+   equivalentes de cuML (`cuml.ensemble.RandomForestClassifier`, y
+   `XGBClassifier(device="cuda")`), corriendo en la partición `nukwa` (GPU).
+   Comparar tiempos CPU vs GPU para el mismo N_SAMPLES.
