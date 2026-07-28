@@ -1,0 +1,4 @@
+modelo,pr_auc,roc_auc,f1_voto
+logistica,0.0908,0.8976,0.0674
+random_forest,0.1072,0.9273,0.0883
+xgboost,0.1285,0.933,0.091

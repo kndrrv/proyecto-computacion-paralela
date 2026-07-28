@@ -1,41 +1,51 @@
 """
-entrenar_ensemble_paralelo.py
-------------------------------
-Version paralelizada de modelo_tes.py: reparte los N_SAMPLES entre nucleos
-usando joblib.Parallel, en vez de entrenarlos uno por uno.
+entrenar_ensemble_gpu.py
+------------------------
+Version GPU (RAPIDS cuML) de entrenar_ensemble_paralelo.py.
 
-Mismo diseno, mismos features, mismos hiperparametros que el original de
-la companera - solo se cambia COMO se recorre el loop de samples, para
-aprovechar Kabre.
+Diferencia clave con la version CPU: ahi el paralelismo lo daba joblib
+repartiendo los N_SAMPLES entre nucleos. Aca cada sample entrena random
+forest y xgboost DENTRO de la GPU (que ya paraleliza internamente), asi
+que se recorre el loop de samples de forma secuencial -- no tiene sentido
+lanzar varios procesos de joblib peleando por la misma GPU.
 
-Uso:
-    python entrenar_ensemble_paralelo.py --n-jobs 8 --n-samples 25
+Mismo diseno, mismos features, mismos hiperparametros que la version CPU:
+- RandomForestClassifier de sklearn -> cuml.ensemble.RandomForestClassifier
+- XGBClassifier: se le agrega device="cuda"
+- LogisticRegression se deja en sklearn/CPU (dataset chico por sample,
+  no es el cuello de botella real)
 
---n-jobs debe coincidir con $SLURM_CPUS_PER_TASK en el script de SLURM.
+Uso (en la particion GPU de Kabre):
+    salloc --partition=nukwa --cpus-per-task=4 --time=02:00:00
+    python entrenar_ensemble_gpu.py --n-samples 25
+
+Guarda el tiempo total en benchmark_entrenamiento_gpu.csv (columnas:
+n_samples,tiempo_segundos) -- insumo directo para la fila de GPU en la
+tabla de speedup/eficiencia (junto con benchmark_entrenamiento.csv de la
+version CPU).
 """
 
 import argparse
 import time
 import joblib
 import numpy as np
+import cupy as cp
 import polars as pl
 import pandas as pd
 from pathlib import Path
-from joblib import Parallel, delayed
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (average_precision_score, roc_auc_score,
-                             f1_score, precision_score, recall_score)
+from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
+from cuml.ensemble import RandomForestClassifier as cuRF
 from xgboost import XGBClassifier
 
 # ---------------------------------------------------------------------------
-# config (identico a modelo_tes.py)
+# config (identico a entrenar_ensemble_paralelo.py)
 # ---------------------------------------------------------------------------
 CSV_PATH = "dataset_gee_centroamerica_completo.csv"
-OUT_DIR = Path("resultados_ensemble")
-MODEL_DIR = Path("modelos_ensemble")
+OUT_DIR = Path("resultados_ensemble_gpu")
+MODEL_DIR = Path("modelos_ensemble_gpu")
 
 N_POR_CLASE = 60_000
 CON_REEMPLAZO = False
@@ -55,49 +65,59 @@ OUT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
 
-def entrenar_un_sample(s, X_pos, X_neg, X_test):
-    """Entrena los 3 modelos para UN sample. Corre en un proceso separado."""
+def _a_numpy(arr):
+    """cuML/XGBoost a veces devuelven cupy, a veces numpy. Normalizamos."""
+    return arr.get() if hasattr(arr, "get") else np.asarray(arr)
+
+
+def entrenar_un_sample_gpu(s, X_pos, X_neg, X_test):
+    """Entrena los 3 modelos para UN sample (RF y XGBoost en GPU)."""
     t0 = time.time()
     rng_local = np.random.default_rng(SEED + s)
 
     idx_pos = rng_local.choice(len(X_pos), size=N_POR_CLASE, replace=CON_REEMPLAZO)
     idx_neg = rng_local.choice(len(X_neg), size=N_POR_CLASE, replace=CON_REEMPLAZO)
 
-    Xb = np.vstack([X_pos[idx_pos], X_neg[idx_neg]])
-    yb = np.concatenate([np.ones(N_POR_CLASE), np.zeros(N_POR_CLASE)])
-
-    modelos = {
-        "logistica": LogisticRegression(max_iter=1000),
-        "random_forest": RandomForestClassifier(
-            n_estimators=100, max_depth=20, n_jobs=1, random_state=SEED),
-        "xgboost": XGBClassifier(
-            n_estimators=300, max_depth=8, learning_rate=0.1,
-            tree_method="hist", n_jobs=1, random_state=SEED,
-            eval_metric="logloss"),
-    }
-    # nota: n_jobs=1 dentro de cada modelo porque el paralelismo ya lo da
-    # joblib.Parallel repartiendo los SAMPLES entre nucleos, no cada modelo.
+    Xb = np.vstack([X_pos[idx_pos], X_neg[idx_neg]]).astype(np.float32)
+    yb = np.concatenate([np.ones(N_POR_CLASE), np.zeros(N_POR_CLASE)]).astype(np.float32)
 
     probas = {}
-    for nombre, modelo in modelos.items():
-        if nombre == "logistica":
-            sc = StandardScaler()
-            modelo.fit(sc.fit_transform(Xb), yb)
-            p = modelo.predict_proba(sc.transform(X_test))[:, 1]
-            # se guarda el scaler junto al modelo (el original no lo hacia)
-            joblib.dump(sc, MODEL_DIR / f"scaler_sample{s}.joblib")
-        else:
-            modelo.fit(Xb, yb)
-            p = modelo.predict_proba(X_test)[:, 1]
-        probas[nombre] = p
-        joblib.dump(modelo, MODEL_DIR / f"{nombre}_sample{s}.joblib")
+
+    # --- random forest: cuML, corre en GPU ---
+    Xb_gpu = cp.asarray(Xb)
+    yb_gpu = cp.asarray(yb)
+    X_test_gpu = cp.asarray(X_test)
+
+    rf = cuRF(n_estimators=100, max_depth=20, random_state=SEED)
+    rf.fit(Xb_gpu, yb_gpu)
+    p_rf = rf.predict_proba(X_test_gpu)[:, 1]
+    probas["random_forest"] = _a_numpy(p_rf)
+    joblib.dump(rf, MODEL_DIR / f"random_forest_sample{s}.joblib")
+
+    # --- xgboost: mismo estimador de siempre, solo cambia el device ---
+    xgb = XGBClassifier(
+        n_estimators=300, max_depth=8, learning_rate=0.1,
+        tree_method="hist", device="cuda", n_jobs=1,
+        random_state=SEED, eval_metric="logloss")
+    xgb.fit(Xb, yb)
+    p_xgb = xgb.predict_proba(X_test)[:, 1]
+    probas["xgboost"] = _a_numpy(p_xgb)
+    joblib.dump(xgb, MODEL_DIR / f"xgboost_sample{s}.joblib")
+
+    # --- logistica: se deja en sklearn/CPU (no es el cuello de botella) ---
+    sc = StandardScaler()
+    log = LogisticRegression(max_iter=1000)
+    log.fit(sc.fit_transform(Xb), yb)
+    p_log = log.predict_proba(sc.transform(X_test))[:, 1]
+    probas["logistica"] = p_log
+    joblib.dump(log, MODEL_DIR / f"logistica_sample{s}.joblib")
+    joblib.dump(sc, MODEL_DIR / f"scaler_sample{s}.joblib")
 
     return probas, time.time() - t0
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-jobs", type=int, default=1)
     parser.add_argument("--n-samples", type=int, default=25)
     args = parser.parse_args()
 
@@ -133,21 +153,21 @@ def main():
     del train, train_pos, train_neg
 
     n_samples = min(args.n_samples, len(X_pos))
-    print(f"n_samples: {n_samples} | n_jobs: {args.n_jobs}")
+    print(f"n_samples: {n_samples} (GPU, secuencial)")
 
     t0 = time.time()
-    resultados = Parallel(n_jobs=args.n_jobs)(
-        delayed(entrenar_un_sample)(s, X_pos, X_neg, X_test)
+    resultados = [
+        entrenar_un_sample_gpu(s, X_pos, X_neg, X_test)
         for s in range(n_samples)
-    )
+    ]
     elapsed = time.time() - t0
-    print(f"[BENCHMARK] n_jobs={args.n_jobs} n_samples={n_samples} tiempo_total={elapsed:.1f}s")
+    print(f"[BENCHMARK-GPU] n_samples={n_samples} tiempo_total={elapsed:.1f}s")
 
-    # log para la tabla de benchmark (speedup, eficiencia)
-    with open("benchmark_entrenamiento.csv", "a") as f:
-        f.write(f"{args.n_jobs},{n_samples},{elapsed:.2f}\n")
+    # log para la fila de GPU en la tabla de benchmark (speedup, eficiencia)
+    with open("benchmark_entrenamiento_gpu.csv", "a") as f:
+        f.write(f"{n_samples},{elapsed:.2f}\n")
 
-    # combinar resultados (promedio de probabilidades = insumo del mapa de calor)
+    # combinar resultados (promedio de probabilidades)
     probas_por_modelo = {"logistica": [], "random_forest": [], "xgboost": []}
     tiempos = []
     for probas, t in resultados:
@@ -169,7 +189,7 @@ def main():
         np.save(OUT_DIR / f"probas_promedio_{nombre}.npy", p_promedio)
 
     tabla = pd.DataFrame(metricas)
-    tabla.to_csv(OUT_DIR / "metricas_ensemble.csv", index=False)
+    tabla.to_csv(OUT_DIR / "metricas_ensemble_gpu.csv", index=False)
     print(tabla.to_string(index=False))
     print(f"tiempo promedio por sample: {np.mean(tiempos):.1f}s")
 

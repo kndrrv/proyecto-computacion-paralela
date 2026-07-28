@@ -3,6 +3,8 @@
 !requirements.txt
 dataset_gee_centroamerica_completo.csv
 dataset_modelo_worldcover.csv
+!benchmark_entrenamiento.csv
+!benchmark_entrenamiento_gpu.csv
 
 # muestras y artefactos intermedios
 *.parquet
@@ -11,14 +13,21 @@ dataset_modelo_worldcover.csv
 # modelos entrenados (pesados, se regeneran corriendo los scripts)
 modelos/
 modelos_ensemble/
+modelos_ensemble_gpu/
 *.joblib
 
 # salidas generadas (se regeneran corriendo los scripts; si se quiere mostrar
 # evidencia en el repo, mover a mano solo las figuras finales a docs/figuras)
 eda_salidas/
 resultados_modelo/
-resultados_ensemble/
 figuras/
+
+# resultados_ensemble* se ignoran por contenido, no como carpeta completa,
+# para poder subir las tablas de metricas como evidencia del benchmark
+resultados_ensemble/*
+!resultados_ensemble/metricas_ensemble.csv
+resultados_ensemble_gpu/*
+!resultados_ensemble_gpu/metricas_ensemble_gpu.csv
 
 # python
 __pycache__/
