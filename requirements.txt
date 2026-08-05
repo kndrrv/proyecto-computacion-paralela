@@ -8,3 +8,5 @@ matplotlib>=3.8
 seaborn>=0.13
 scipy>=1.11
 pyarrow>=15.0
+folium>=0.16
+plotly>=5.20
